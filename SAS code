@@ -1,0 +1,132 @@
+%macro jackknife_bayes_mcmc_logit(
+    data=,
+    depvar=,
+    preds=,
+    weight=,
+    reps=,
+    outest=
+);
+/*-----------------------------------------------------------------------
+  Jackknife Bayesian logistic regression using PROC MCMC
+  Loops over replicate weights (rkrnwgta1–rkrnwgta&reps)
+------------------------------------------------------------------------*/
+
+  /*initialize dataset to collect output estimate results across jackknife reps*/
+%let bvars=;
+%let n=1;
+%let nextpred=%scan(&preds, &n);
+%do %while("&nextpred" ne "");
+    %let bvars=&bvars b&nextpred;
+    %let n=%eval(&n+1);
+    %let nextpred=%scan(&preds, &n);
+%end;
+
+data &outest;
+    length Iteration intercept replicate &bvars 8;
+    stop;
+run;
+%do i = 0 %to &reps;
+    %if &i = 0 %then %let wvar = &weight; 
+    %else %let wvar = rkrnwgta&i;
+/*progress report*/
+    %put NOTE: Running replicate &i with weight = &wvar;
+/*fitting out the logit model in mcmc*/
+    proc mcmc data=&data nmc=10000 thin=10 seed=8675309 outpost=solF;
+      parms intercept 0;
+      %let n=1;
+      %let nextpred=%scan(&preds, &n);
+      %do %while("&nextpred" ^= "");
+        parms b&nextpred 0;
+        %let n=%eval(&n+1);
+        %let nextpred=%scan(&preds, &n);
+      %end;
+      /*weakly informative priors */
+      prior intercept ~ normal(0, var=100);
+      %let n=1;
+      %let nextpred=%scan(&preds, &n);
+      %do %while("&nextpred" ^= "");
+        prior b&nextpred ~ normal(0, var=100);
+        %let n=%eval(&n+1);
+        %let nextpred=%scan(&preds, &n);
+      %end;
+      /*linear predictor */
+      eta = intercept
+      %let n=1;
+      %let nextpred=%scan(&preds, &n);
+      %do %while("&nextpred" ^= "");
+        + b&nextpred * &nextpred
+        %let n=%eval(&n+1);
+        %let nextpred=%scan(&preds, &n);
+      %end;
+      ;
+      mu = logistic(eta);
+      /*weighted log-likelihood */
+      w = &wvar;
+      loglike = w * (&depvar*log(mu) + (1-&depvar)*log(1-mu));
+      model general(loglike);
+
+/*identify posterior outputs with their replicates into dataset*/
+data solF;
+      set solF;
+      replicate = &i;
+    run;
+    proc append base=&outest data=solF force; run;
+  %end;
+%mend;
+
+/*call to run macro*/
+%jackknife_bayes_mcmc_logit(
+  data=nssrn,
+  depvar=rural2,
+  preds=union,
+  weight=rkrnwgta,
+  reps=80,
+  outest=jackknife_estimates
+);
+
+/*produce OR and Predicted Probabilities, 
+from this you could simply do some bayesian inference
+as their is posterior distributions at each replicate
+but this doesn't bring in the jk adj. for design necessarily*/
+data bayes_inf_reps;
+set jackknife_estimates;
+or_bunion=exp(bunion);
+Pr11=1/(1+exp(-(intercept+bunion*1)));
+Pr10=1/(1+exp(-(intercept+bunion*0)));
+run;
+
+/*approaching the jackknife estimations,
+the sql step will pull on the linear predictors,
+produce pull point estimate, derive standard errors, and compute 95% CI*/
+proc sql;
+    create table estWjackse as
+    select 
+        /*full-sample (replicate=0) point estimates */
+        full.meanb0 as meanb0,
+        full.meanb1 as meanb1,
+        /*dynamically compute number of replicates (excluding replicate=0) */
+        sqrt(((nreps/(nreps-1)) * sum((r.meanb0 - full.meanb0)**2))) as jackseb0,
+        sqrt(((nreps/(nreps-1)) * sum((r.meanb1 - full.meanb1)**2))) as jackseb1,
+        /*95% Confidence Intervals*/
+        (full.meanb0 - 1.96 * calculated jackseb0) as b0LCL95,
+        (full.meanb0 + 1.96 * calculated jackseb0) as b0UCL95,
+        (full.meanb1 - 1.96 * calculated jackseb1) as b1LCL95,
+        (full.meanb1 + 1.96 * calculated jackseb1) as b1UCL95
+    from 
+        /*replicate means*/
+        (select replicate, 
+                mean(intercept) as meanb0, 
+                mean(bunion) as meanb1
+         from jackknife_estimates
+         group by replicate) as r,
+        /*full-sample mean (replicate=0)*/
+        (select mean(intercept) as meanb0, 
+                mean(bunion) as meanb1
+         from jackknife_estimates
+         where replicate=0) as full,
+        /*fetch total number of replicate weights*/
+        (select count(distinct replicate) - 1 as nreps
+         from jackknife_estimates
+         where replicate > 0) as meta
+    where r.replicate > 0;
+quit;
